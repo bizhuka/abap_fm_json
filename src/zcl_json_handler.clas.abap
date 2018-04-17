@@ -21,6 +21,7 @@ public section.
       !NAME type STRING optional
       !UPCASE type XFELD optional
       !CAMELCASE type XFELD optional
+      !CONVERT_BOOLEAN type ABAP_BOOL default ABAP_FALSE
     returning
       value(JSON_STRING) type STRING
     exceptions
@@ -158,6 +159,8 @@ protected section.
 *"* protected components of class ZCL_JSON_HANDLER
 *"* do not include other source files here!!!
 private section.
+
+  class-data MT_XSDBOOLEAN type STRINGTAB .
 *"* private components of class ZCL_JSON_HANDLER
 *"* do not include other source files here!!!
 ENDCLASS.
@@ -187,14 +190,17 @@ method ABAP2JSON.
     dont_quote type xfeld,
     json_fragments type table of string,
     rec_json_string type string,
-    l_type  type c,
-    s_type type c,
+    " l_type  type c,
+    " s_type  type c,
     l_comps type i,
+    lo_type type ref to cl_abap_typedescr,
+    lo_subtype type ref to cl_abap_typedescr,
     l_lines type i,
     l_index type i,
     l_value type string,
     l_name type string,
-    l_strudescr type ref to cl_abap_structdescr.
+    l_strudescr type ref to cl_abap_structdescr,
+    lv_type     type ref to string.
 
   field-symbols:
     <abap_data> type any,
@@ -203,6 +209,26 @@ method ABAP2JSON.
     <comp> type any,
     <abapcomp> type abap_compdescr.
 
+  " Read all rollnames by domain (1 time only)
+  IF convert_boolean = abap_true AND mt_xsdboolean[] IS INITIAL.
+    " Get all boolean types
+    SELECT rollname INTO TABLE mt_xsdboolean
+    FROM dd04l
+    WHERE domname = 'XSDBOOLEAN' AND as4local = 'A' AND as4vers = 0.
+
+    " for safety
+    IF mt_xsdboolean[] IS INITIAL.
+      APPEND INITIAL LINE TO mt_xsdboolean.
+    ENDIF.
+
+    " Add text for speed
+    LOOP AT mt_xsdboolean REFERENCE INTO lv_type.
+      CONCATENATE '\TYPE=' lv_type->* INTO lv_type->*.
+    ENDLOOP.
+
+    " Is standard table
+    SORT mt_xsdboolean BY table_line.
+  ENDIF.
 
   define get_scalar_value.
     " &1 : assigned var
@@ -212,7 +238,7 @@ method ABAP2JSON.
 ****************************************************
 * Adapt some basic ABAP types (pending inclusion of all basic abap types?)
 * Feel free to customize this for your needs
-    case &3.
+    case &3->type_kind.
 *       1. ABAP numeric types
       when 'I'. " Integer
         condense &1.
@@ -249,14 +275,35 @@ method ABAP2JSON.
 *           condense &1.
 
       when 'C' or 'g'. " Char sequences and Strings
+
+        DO 1 TIMES.
+          " true & false
+          CHECK convert_boolean = abap_true.
+
+          " Check by rollname
+          READ TABLE mt_xsdboolean TRANSPORTING NO FIELDS BINARY SEARCH
+            WITH KEY table_line = &3->absolute_name.
+          CHECK sy-subrc = 0.
+
+          " No quotes
+          dont_quote = 'X'.
+          IF &2 = abap_true.
+            &1 = 'true'.
+          ELSE.
+            &1 = 'false'.
+          ENDIF.
+        ENDDO.
+
 * Put safe chars
-        replace all occurrences of '\' in &1 with '\\' .
-        replace all occurrences of '"' in &1 with '\"' .
-        replace all occurrences of cl_abap_char_utilities=>cr_lf in &1 with '\r\n' .
-        replace all occurrences of cl_abap_char_utilities=>newline in &1 with '\n' .
-        replace all occurrences of cl_abap_char_utilities=>horizontal_tab in &1 with '\t' .
-        replace all occurrences of cl_abap_char_utilities=>backspace in &1 with '\b' .
-        replace all occurrences of cl_abap_char_utilities=>form_feed in &1 with '\f' .
+        IF dont_quote <> abap_true.
+          replace all occurrences of '\' in &1 with '\\' .
+          replace all occurrences of '"' in &1 with '\"' .
+          replace all occurrences of cl_abap_char_utilities=>cr_lf in &1 with '\r\n' .
+          replace all occurrences of cl_abap_char_utilities=>newline in &1 with '\n' .
+          replace all occurrences of cl_abap_char_utilities=>horizontal_tab in &1 with '\t' .
+          replace all occurrences of cl_abap_char_utilities=>backspace in &1 with '\b' .
+          replace all occurrences of cl_abap_char_utilities=>form_feed in &1 with '\f' .
+        ENDIF.
 
       when 'y'.  " XSTRING
 * Put the XSTRING in Base64
@@ -290,29 +337,41 @@ method ABAP2JSON.
 
 **
 * Get ABAP data type
-  describe field abap_data type l_type components l_comps.
+  " DESCRIBE FIELD im_data TYPE l_type COMPONENTS l_comps.
+  lo_type = cl_abap_typedescr=>describe_by_data( abap_data ).
 
 ***************************************************
 *  Get rid of data references
 ***************************************************
-  if l_type eq cl_abap_typedescr=>typekind_dref.
-    assign abap_data->* to <abap_data>.
-    if sy-subrc ne 0.
-      append '{}' to json_fragments.
-      concatenate lines of json_fragments into json_string.
-      exit.
-    endif.
-  else.
-    assign abap_data to <abap_data>.
-  endif.
+  IF lo_type->type_kind EQ cl_abap_typedescr=>typekind_dref.
+    ASSIGN abap_data->* TO <abap_data>.
+    " second time
+    lo_type = cl_abap_typedescr=>describe_by_data( <abap_data> ).
+
+    IF sy-subrc NE 0.
+      APPEND '{}' TO json_fragments.
+      CONCATENATE LINES OF json_fragments INTO json_string.
+      EXIT.
+    ENDIF.
+  ELSE.
+    ASSIGN abap_data TO <abap_data>.
+  ENDIF.
 
 * Get ABAP data type again and start
-  describe field <abap_data> type l_type components l_comps.
+  " DESCRIBE FIELD <abap_data> TYPE l_type COMPONENTS l_comps.
+
+  " A little fastaer than description of description
+  TRY.
+      l_strudescr ?= lo_type.
+    CATCH cx_sy_move_cast_error.
+      " Is not structure
+      CLEAR l_strudescr.
+  ENDTRY.
 
 ***************************************************
 *  Tables
 ***************************************************
-  if l_type eq cl_abap_typedescr=>typekind_table.
+  if lo_type->type_kind eq cl_abap_typedescr=>typekind_table.
 * '[' JSON table opening bracket
     append '[' to json_fragments.
     assign <abap_data> to <itab>.
@@ -320,7 +379,7 @@ method ABAP2JSON.
     loop at <itab> assigning <comp>.
       add 1 to l_index.
 *> Recursive call for each table row:
-      rec_json_string = abap2json( abap_data = <comp> upcase = upcase camelcase = camelcase ).
+      rec_json_string = abap2json( abap_data = <comp> upcase = upcase camelcase = camelcase convert_boolean = convert_boolean ).
       append rec_json_string to json_fragments.
       clear rec_json_string.
       if l_index < l_lines.
@@ -335,10 +394,12 @@ method ABAP2JSON.
 *  Structures
 ***************************************************
   else.
-    if l_comps is not initial.
+    " Is structure
+    if l_strudescr IS NOT INITIAL.
 * '{' JSON object opening curly brace
       append '{' to json_fragments.
       l_strudescr ?= cl_abap_typedescr=>describe_by_data( <abap_data> ).
+      l_comps = lines( l_strudescr->components ).
       loop at l_strudescr->components assigning <abapcomp>.
         l_index = sy-tabix .
         assign component <abapcomp>-name of structure <abap_data> to <comp>.
@@ -351,16 +412,18 @@ method ABAP2JSON.
         if camelcase eq 'X'.
              l_name = to_mixed( val = l_name  case = 'a' ).
         endif.
-        describe field <comp> type s_type.
-        if s_type eq cl_abap_typedescr=>typekind_table or s_type eq cl_abap_typedescr=>typekind_dref or
-           s_type eq cl_abap_typedescr=>typekind_struct1 or s_type eq cl_abap_typedescr=>typekind_struct2.
+
+        " describe field <comp> type s_type.
+        lo_subtype = cl_abap_typedescr=>describe_by_data( <comp> ).
+        if lo_subtype->type_kind eq cl_abap_typedescr=>typekind_table   or lo_subtype->type_kind eq cl_abap_typedescr=>typekind_dref or
+           lo_subtype->type_kind eq cl_abap_typedescr=>typekind_struct1 or lo_subtype->type_kind eq cl_abap_typedescr=>typekind_struct2.
 *> Recursive call for non-scalars:
-          rec_json_string = abap2json( abap_data = <comp> name = l_name upcase = upcase camelcase = camelcase ).
+          rec_json_string = abap2json( abap_data = <comp> name = l_name upcase = upcase camelcase = camelcase convert_boolean = convert_boolean ).
         else.
-          if s_type eq cl_abap_typedescr=>TYPEKIND_OREF or s_type eq cl_abap_typedescr=>TYPEKIND_IREF.
+          if lo_subtype->type_kind eq cl_abap_typedescr=>TYPEKIND_OREF or lo_subtype->type_kind eq cl_abap_typedescr=>TYPEKIND_IREF.
             rec_json_string = '"REF UNSUPPORTED"'.
           else.
-            get_scalar_value rec_json_string <comp> s_type.
+            get_scalar_value rec_json_string <comp> lo_subtype.
           endif.
           concatenate c_quote l_name c_quote c_colon rec_json_string into rec_json_string.
         endif.
@@ -378,7 +441,7 @@ method ABAP2JSON.
 *                  - Scalars -                     *
 ****************************************************
     else.
-      get_scalar_value l_value <abap_data> l_type.
+      get_scalar_value l_value <abap_data> lo_type.
       append l_value to json_fragments.
 
     endif.
